@@ -1,20 +1,45 @@
+import type { PropertyValues } from "lit";
 import { ReactiveElement } from "lit";
 import { customElement, property } from "lit/decorators";
+import hash from "object-hash";
 import { fireEvent } from "../common/dom/fire_event";
 import { renderMarkdown } from "../resources/render-markdown";
+import { CacheManager } from "../util/cache-manager";
 
-const _blockQuoteToAlert = { Note: "info", Warning: "warning" };
+const markdownCache = new CacheManager<string>(1000);
+
+const _gitHubMarkdownAlerts = {
+  reType:
+    /(?<input>(\[!(?<type>caution|important|note|tip|warning)\])(?:\s|\\n)?)/i,
+  typeToHaAlert: {
+    caution: "error",
+    important: "info",
+    note: "info",
+    tip: "success",
+    warning: "warning",
+  },
+};
 
 @customElement("ha-markdown-element")
 class HaMarkdownElement extends ReactiveElement {
   @property() public content?;
 
-  @property({ type: Boolean }) public allowSvg = false;
+  @property({ attribute: "allow-svg", type: Boolean }) public allowSvg = false;
 
   @property({ type: Boolean }) public breaks = false;
 
   @property({ type: Boolean, attribute: "lazy-images" }) public lazyImages =
     false;
+
+  @property({ type: Boolean }) public cache = false;
+
+  public disconnectedCallback() {
+    super.disconnectedCallback();
+    if (this.cache) {
+      const key = this._computeCacheKey();
+      markdownCache.set(key, this.innerHTML);
+    }
+  }
 
   protected createRenderRoot() {
     return this;
@@ -25,6 +50,24 @@ class HaMarkdownElement extends ReactiveElement {
     if (this.content !== undefined) {
       this._render();
     }
+  }
+
+  protected willUpdate(_changedProperties: PropertyValues): void {
+    if (!this.innerHTML && this.cache) {
+      const key = this._computeCacheKey();
+      if (markdownCache.has(key)) {
+        this.innerHTML = markdownCache.get(key)!;
+        this._resize();
+      }
+    }
+  }
+
+  private _computeCacheKey() {
+    return hash({
+      content: this.content,
+      allowSvg: this.allowSvg,
+      breaks: this.breaks,
+    });
   }
 
   private async _render() {
@@ -68,38 +111,66 @@ class HaMarkdownElement extends ReactiveElement {
         }
         node.addEventListener("load", this._resize);
       } else if (node instanceof HTMLQuoteElement) {
-        // Map GitHub blockquote elements to our ha-alert element
-        const firstElementChild = node.firstElementChild;
-        const quoteTitleElement = firstElementChild?.firstElementChild;
-        const quoteType =
-          quoteTitleElement?.textContent &&
-          _blockQuoteToAlert[quoteTitleElement.textContent];
+        /**
+         * Map GitHub blockquote elements to our ha-alert element
+         * https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
+         */
+        const gitHubAlertMatch =
+          node.firstElementChild?.firstChild?.textContent &&
+          _gitHubMarkdownAlerts.reType.exec(
+            node.firstElementChild.firstChild.textContent
+          );
 
-        // GitHub is strict on how these are defined, we need to make sure we know what we have before starting to replace it
-        if (quoteTitleElement?.nodeName === "STRONG" && quoteType) {
-          const alertNote = document.createElement("ha-alert");
-          alertNote.alertType = quoteType;
-          alertNote.title =
-            (firstElementChild!.childNodes[1].nodeName === "#text" &&
-              firstElementChild!.childNodes[1].textContent?.trimStart()) ||
-            "";
+        if (gitHubAlertMatch) {
+          const { type: alertType } = gitHubAlertMatch.groups!;
+          const haAlertNode = document.createElement("ha-alert");
+          haAlertNode.alertType =
+            _gitHubMarkdownAlerts.typeToHaAlert[alertType.toLowerCase()];
 
-          const childNodes = Array.from(firstElementChild!.childNodes);
-          for (const child of childNodes.slice(
-            childNodes.findIndex(
-              // There is always a line break between the title and the content, we want to skip that
-              (childNode) => childNode instanceof HTMLBRElement
-            ) + 1
-          )) {
-            alertNote.appendChild(child);
-          }
-          node.firstElementChild!.replaceWith(alertNote);
+          haAlertNode.append(
+            ...Array.from(node.childNodes)
+              .map((child) => {
+                const arr = Array.from(child.childNodes);
+                if (!this.breaks && arr.length) {
+                  // When we are not breaking, the first line of the blockquote is not considered,
+                  // so we need to adjust the first child text content
+                  const firstChild = arr[0];
+                  if (
+                    firstChild.nodeType === Node.TEXT_NODE &&
+                    firstChild.textContent === gitHubAlertMatch.input &&
+                    firstChild.textContent?.includes("\n")
+                  ) {
+                    firstChild.textContent = firstChild.textContent
+                      .split("\n")
+                      .slice(1)
+                      .join("\n");
+                  }
+                }
+                return arr;
+              })
+              .reduce((acc, val) => acc.concat(val), [])
+              .filter(
+                (childNode) =>
+                  childNode.textContent &&
+                  childNode.textContent !== gitHubAlertMatch.input
+              )
+          );
+          walker.parentNode()!.replaceChild(haAlertNode, node);
         }
+      } else if (
+        node instanceof HTMLElement &&
+        ["ha-alert", "ha-qr-code", "ha-icon", "ha-svg-icon"].includes(
+          node.localName
+        )
+      ) {
+        import(
+          /* webpackInclude: /(ha-alert)|(ha-qr-code)|(ha-icon)|(ha-svg-icon)/ */ `./${node.localName}`
+        );
       }
     }
   }
 
-  private _resize = () => fireEvent(this, "iron-resize");
+  private _resize = () => fireEvent(this, "content-resize");
 }
 
 declare global {

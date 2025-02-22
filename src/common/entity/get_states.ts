@@ -1,6 +1,9 @@
-import { HassEntity } from "home-assistant-js-websocket";
+import type { HassEntity } from "home-assistant-js-websocket";
 import { computeStateDomain } from "./compute_state_domain";
 import { UNAVAILABLE_STATES } from "../../data/entity";
+import type { HomeAssistant } from "../../types";
+import { computeDomain } from "./compute_domain";
+import { stringCompare } from "../string/compare";
 
 export const FIXED_DOMAIN_STATES = {
   alarm_control_panel: [
@@ -15,6 +18,7 @@ export const FIXED_DOMAIN_STATES = {
     "pending",
     "triggered",
   ],
+  assist_satellite: ["idle", "listening", "responding", "processing"],
   automation: ["on", "off"],
   binary_sensor: ["on", "off"],
   button: [],
@@ -26,9 +30,26 @@ export const FIXED_DOMAIN_STATES = {
   humidifier: ["on", "off"],
   input_boolean: ["on", "off"],
   input_button: [],
+  lawn_mower: ["error", "paused", "mowing", "returning", "docked"],
   light: ["on", "off"],
-  lock: ["jammed", "locked", "locking", "unlocked", "unlocking"],
-  media_player: ["idle", "off", "paused", "playing", "standby"],
+  lock: [
+    "jammed",
+    "locked",
+    "locking",
+    "unlocked",
+    "unlocking",
+    "opening",
+    "open",
+  ],
+  media_player: [
+    "off",
+    "on",
+    "idle",
+    "playing",
+    "paused",
+    "standby",
+    "buffering",
+  ],
   person: ["home", "not_home"],
   plant: ["ok", "problem"],
   remote: ["on", "off"],
@@ -41,6 +62,7 @@ export const FIXED_DOMAIN_STATES = {
   timer: ["active", "idle", "paused"],
   update: ["on", "off"],
   vacuum: ["cleaning", "docked", "error", "idle", "paused", "returning"],
+  valve: ["closed", "closing", "open", "opening"],
   weather: [
     "clear-night",
     "cloudy",
@@ -107,6 +129,7 @@ const FIXED_DOMAIN_ATTRIBUTE_STATES = {
       "off",
       "idle",
       "preheating",
+      "defrosting",
       "heating",
       "cooling",
       "drying",
@@ -146,7 +169,7 @@ const FIXED_DOMAIN_ATTRIBUTE_STATES = {
       "channel",
       "channels",
       "composer",
-      "contibuting_artist",
+      "contributing_artist",
       "episode",
       "game",
       "genre",
@@ -186,6 +209,7 @@ const FIXED_DOMAIN_ATTRIBUTE_STATES = {
       "nitrogen_monoxide",
       "nitrous_oxide",
       "ozone",
+      "ph",
       "pm1",
       "pm10",
       "pm25",
@@ -200,6 +224,7 @@ const FIXED_DOMAIN_ATTRIBUTE_STATES = {
       "volatile_organic_compounds",
       "volatile_organic_compounds_parts",
       "voltage",
+      "volume_flow_rate",
     ],
     state_class: ["measurement", "total", "total_increasing"],
   },
@@ -215,6 +240,7 @@ const FIXED_DOMAIN_ATTRIBUTE_STATES = {
 };
 
 export const getStates = (
+  hass: HomeAssistant,
   state: HassEntity,
   attribute: string | undefined = undefined
 ): string[] => {
@@ -247,7 +273,24 @@ export const getStates = (
     case "device_tracker":
     case "person":
       if (!attribute) {
-        result.push("home", "not_home");
+        result.push(
+          ...Object.entries(hass.states)
+            .filter(
+              ([entityId, stateObj]) =>
+                computeDomain(entityId) === "zone" &&
+                entityId !== "zone.home" &&
+                stateObj.attributes.friendly_name
+            )
+            .map(([_entityId, stateObj]) => stateObj.attributes.friendly_name!)
+            .sort((zone1, zone2) =>
+              stringCompare(zone1, zone2, hass.locale.language)
+            )
+        );
+      }
+      break;
+    case "event":
+      if (attribute === "event_type") {
+        result.push(...state.attributes.event_types);
       }
       break;
     case "fan":

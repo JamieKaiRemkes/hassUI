@@ -7,30 +7,33 @@ import type {
 import { BINARY_STATE_ON } from "../common/const";
 import { computeDomain } from "../common/entity/compute_domain";
 import { computeStateDomain } from "../common/entity/compute_state_domain";
-import {
-  supportsFeature,
-  supportsFeatureFromAttributes,
-} from "../common/entity/supports-feature";
+import { supportsFeature } from "../common/entity/supports-feature";
+import { formatNumber } from "../common/number/format_number";
 import { caseInsensitiveStringCompare } from "../common/string/compare";
 import { showAlertDialog } from "../dialogs/generic/show-dialog-box";
-import { HomeAssistant } from "../types";
+import type { HomeAssistant } from "../types";
 import { showToast } from "../util/toast";
+import type { EntitySources } from "./entity_sources";
 
-export const UPDATE_SUPPORT_INSTALL = 1;
-export const UPDATE_SUPPORT_SPECIFIC_VERSION = 2;
-export const UPDATE_SUPPORT_PROGRESS = 4;
-export const UPDATE_SUPPORT_BACKUP = 8;
-export const UPDATE_SUPPORT_RELEASE_NOTES = 16;
+export enum UpdateEntityFeature {
+  INSTALL = 1,
+  SPECIFIC_VERSION = 2,
+  PROGRESS = 4,
+  BACKUP = 8,
+  RELEASE_NOTES = 16,
+}
 
 interface UpdateEntityAttributes extends HassEntityAttributeBase {
   auto_update: boolean | null;
+  display_precision: number;
   installed_version: string | null;
-  in_progress: boolean | number;
+  in_progress: boolean;
   latest_version: string | null;
   release_summary: string | null;
   release_url: string | null;
   skipped_version: string | null;
   title: string | null;
+  update_percentage: number | null;
 }
 
 export interface UpdateEntity extends HassEntityBase {
@@ -38,13 +41,8 @@ export interface UpdateEntity extends HassEntityBase {
 }
 
 export const updateUsesProgress = (entity: UpdateEntity): boolean =>
-  updateUsesProgressFromAttributes(entity.attributes);
-
-export const updateUsesProgressFromAttributes = (attributes: {
-  [key: string]: any;
-}): boolean =>
-  supportsFeatureFromAttributes(attributes, UPDATE_SUPPORT_PROGRESS) &&
-  typeof attributes.in_progress === "number";
+  supportsFeature(entity, UpdateEntityFeature.PROGRESS) &&
+  entity.attributes.update_percentage !== null;
 
 export const updateCanInstall = (
   entity: UpdateEntity,
@@ -52,21 +50,20 @@ export const updateCanInstall = (
 ): boolean =>
   (entity.state === BINARY_STATE_ON ||
     (showSkipped && Boolean(entity.attributes.skipped_version))) &&
-  supportsFeature(entity, UPDATE_SUPPORT_INSTALL);
+  supportsFeature(entity, UpdateEntityFeature.INSTALL);
 
 export const updateIsInstalling = (entity: UpdateEntity): boolean =>
-  updateUsesProgress(entity) || !!entity.attributes.in_progress;
-
-export const updateIsInstallingFromAttributes = (attributes: {
-  [key: string]: any;
-}): boolean =>
-  updateUsesProgressFromAttributes(attributes) || !!attributes.in_progress;
+  !!entity.attributes.in_progress;
 
 export const updateReleaseNotes = (hass: HomeAssistant, entityId: string) =>
   hass.callWS<string | null>({
     type: "update/release_notes",
     entity_id: entityId,
   });
+
+const HOME_ASSISTANT_CORE_TITLE = "Home Assistant Core";
+const HOME_ASSISTANT_SUPERVISOR_TITLE = "Home Assistant Supervisor";
+const HOME_ASSISTANT_OS_TITLE = "Home Assistant Operating System";
 
 export const filterUpdateEntities = (
   entities: HassEntities,
@@ -77,22 +74,22 @@ export const filterUpdateEntities = (
       (entity) => computeStateDomain(entity) === "update"
     ) as UpdateEntity[]
   ).sort((a, b) => {
-    if (a.attributes.title === "Home Assistant Core") {
+    if (a.attributes.title === HOME_ASSISTANT_CORE_TITLE) {
       return -3;
     }
-    if (b.attributes.title === "Home Assistant Core") {
+    if (b.attributes.title === HOME_ASSISTANT_CORE_TITLE) {
       return 3;
     }
-    if (a.attributes.title === "Home Assistant Operating System") {
+    if (a.attributes.title === HOME_ASSISTANT_OS_TITLE) {
       return -2;
     }
-    if (b.attributes.title === "Home Assistant Operating System") {
+    if (b.attributes.title === HOME_ASSISTANT_OS_TITLE) {
       return 2;
     }
-    if (a.attributes.title === "Home Assistant Supervisor") {
+    if (a.attributes.title === HOME_ASSISTANT_SUPERVISOR_TITLE) {
       return -1;
     }
-    if (b.attributes.title === "Home Assistant Supervisor") {
+    if (b.attributes.title === HOME_ASSISTANT_SUPERVISOR_TITLE) {
       return 1;
     }
     return caseInsensitiveStringCompare(
@@ -129,6 +126,10 @@ export const checkForEntityUpdates = async (
     return;
   }
 
+  showToast(element, {
+    message: hass.localize("ui.panel.config.updates.checking_updates"),
+  });
+
   let updated = 0;
 
   const unsubscribeEvents = await hass.connection.subscribeEvents<HassEvent>(
@@ -151,7 +152,7 @@ export const checkForEntityUpdates = async (
 
   // there is no reliable way to know if all the updates are done updating, so we just wait a bit for now...
   await new Promise((r) => {
-    setTimeout(r, 10000);
+    setTimeout(r, 15000);
   });
 
   unsubscribeEvents();
@@ -161,4 +162,76 @@ export const checkForEntityUpdates = async (
       message: hass.localize("ui.panel.config.updates.no_new_updates"),
     });
   }
+};
+
+// When updating, and entity does not support % show "Installing"
+// When updating, and entity does support % show "Installing (xx%)"
+// When update available, show "Update available"
+// When the latest version is skipped, show the latest version
+// When update is not available, show "Up-to-date"
+// When update is not available and there is no latest_version show "Unavailable"
+export const computeUpdateStateDisplay = (
+  stateObj: UpdateEntity,
+  hass: HomeAssistant
+): string => {
+  const state = stateObj.state;
+  const attributes = stateObj.attributes;
+
+  if (state === "off") {
+    const isSkipped =
+      attributes.latest_version &&
+      attributes.skipped_version === attributes.latest_version;
+    if (isSkipped) {
+      return attributes.latest_version!;
+    }
+    return hass.formatEntityState(stateObj);
+  }
+
+  if (state === "on") {
+    if (updateIsInstalling(stateObj)) {
+      const supportsProgress =
+        supportsFeature(stateObj, UpdateEntityFeature.PROGRESS) &&
+        attributes.update_percentage !== null;
+      if (supportsProgress) {
+        return hass.localize("ui.card.update.installing_with_progress", {
+          progress: formatNumber(attributes.update_percentage!, hass.locale, {
+            maximumFractionDigits: attributes.display_precision,
+            minimumFractionDigits: attributes.display_precision,
+          }),
+        });
+      }
+      return hass.localize("ui.card.update.installing");
+    }
+  }
+
+  return hass.formatEntityState(stateObj);
+};
+
+type UpdateType = "addon" | "home_assistant" | "generic";
+
+export const getUpdateType = (
+  stateObj: UpdateEntity,
+  entitySources: EntitySources
+): UpdateType => {
+  const entity_id = stateObj.entity_id;
+  const domain = entitySources[entity_id]?.domain;
+  if (domain !== "hassio") {
+    return "generic";
+  }
+
+  const title = stateObj.attributes.title || "";
+  if (title === HOME_ASSISTANT_CORE_TITLE) {
+    return "home_assistant";
+  }
+
+  if (
+    ![
+      HOME_ASSISTANT_CORE_TITLE,
+      HOME_ASSISTANT_SUPERVISOR_TITLE,
+      HOME_ASSISTANT_OS_TITLE,
+    ].includes(title)
+  ) {
+    return "addon";
+  }
+  return "generic";
 };

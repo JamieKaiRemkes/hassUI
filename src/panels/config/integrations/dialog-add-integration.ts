@@ -1,43 +1,42 @@
 import "@material/mwc-button";
 import "@material/mwc-list/mwc-list";
+import type { IFuseOptions } from "fuse.js";
 import Fuse from "fuse.js";
-import { HassConfig } from "home-assistant-js-websocket";
-import {
-  css,
-  html,
-  LitElement,
-  PropertyValues,
-  TemplateResult,
-  nothing,
-} from "lit";
+import type { HassConfig } from "home-assistant-js-websocket";
+import type { PropertyValues, TemplateResult } from "lit";
+import { LitElement, css, html, nothing } from "lit";
 import { customElement, state } from "lit/decorators";
+import { ifDefined } from "lit/directives/if-defined";
 import { styleMap } from "lit/directives/style-map";
 import memoizeOne from "memoize-one";
 import { isComponentLoaded } from "../../../common/config/is_component_loaded";
 import { fireEvent } from "../../../common/dom/fire_event";
 import {
-  protocolIntegrationPicked,
   PROTOCOL_INTEGRATIONS,
+  protocolIntegrationPicked,
 } from "../../../common/integrations/protocolIntegrationPicked";
 import { navigate } from "../../../common/navigate";
 import { caseInsensitiveStringCompare } from "../../../common/string/compare";
-import { LocalizeFunc } from "../../../common/translations/localize";
+import type { LocalizeFunc } from "../../../common/translations/localize";
 import { createCloseHeading } from "../../../components/ha-dialog";
 import "../../../components/ha-icon-button-prev";
 import "../../../components/search-input";
+import { getConfigEntries } from "../../../data/config_entries";
 import { fetchConfigFlowInProgress } from "../../../data/config_flow";
-import { DataEntryFlowProgress } from "../../../data/data_entry_flow";
+import type { DataEntryFlowProgress } from "../../../data/data_entry_flow";
 import {
   domainToName,
   fetchIntegrationManifest,
 } from "../../../data/integration";
-import {
+import type {
   Brand,
   Brands,
-  findIntegration,
-  getIntegrationDescriptions,
   Integration,
   Integrations,
+} from "../../../data/integrations";
+import {
+  findIntegration,
+  getIntegrationDescriptions,
 } from "../../../data/integrations";
 import { showConfigFlowDialog } from "../../../dialogs/config-flow/show-dialog-config-flow";
 import {
@@ -49,10 +48,8 @@ import { loadVirtualizer } from "../../../resources/virtualizer";
 import type { HomeAssistant } from "../../../types";
 import "./ha-domain-integrations";
 import "./ha-integration-list-item";
-import {
-  AddIntegrationDialogParams,
-  showYamlIntegrationDialog,
-} from "./show-add-integration-dialog";
+import type { AddIntegrationDialogParams } from "./show-add-integration-dialog";
+import { showYamlIntegrationDialog } from "./show-add-integration-dialog";
 
 export interface IntegrationListItem {
   name: string;
@@ -65,7 +62,9 @@ export interface IntegrationListItem {
   supported_by?: string;
   cloud?: boolean;
   is_built_in?: boolean;
+  overwrites_built_in?: boolean;
   is_add?: boolean;
+  single_config_entry?: boolean;
 }
 
 @customElement("dialog-add-integration")
@@ -139,12 +138,13 @@ class AddIntegrationDialog extends LitElement {
     }
     if (this._initialFilter !== undefined && this._filter === "") {
       this._initialFilter = undefined;
-      this._filter = "";
+      this._filter = undefined;
       this._width = undefined;
       this._height = undefined;
     } else if (
       this.hasUpdated &&
       changedProps.has("_filter") &&
+      !changedProps.has("_open") &&
       (!this._width || !this._height)
     ) {
       // Store the width and height so that when we search, box doesn't jump
@@ -187,6 +187,14 @@ class AddIntegrationDialog extends LitElement {
       Object.entries(i).forEach(([domain, integration]) => {
         if (
           "integration_type" in integration &&
+          integration.integration_type === "hardware"
+        ) {
+          // Ignore hardware integrations, they cannot be added via UI
+          return;
+        }
+
+        if (
+          "integration_type" in integration &&
           (integration.config_flow ||
             integration.iot_standards ||
             integration.supported_by)
@@ -205,7 +213,9 @@ class AddIntegrationDialog extends LitElement {
             iot_standards: supportedIntegration.iot_standards,
             supported_by: integration.supported_by,
             is_built_in: supportedIntegration.is_built_in !== false,
+            overwrites_built_in: integration.overwrites_built_in,
             cloud: supportedIntegration.iot_class?.startsWith("cloud_"),
+            single_config_entry: integration.single_config_entry,
           });
         } else if (
           !("integration_type" in integration) &&
@@ -225,6 +235,7 @@ class AddIntegrationDialog extends LitElement {
               ? Object.keys(integration.integrations)
               : undefined,
             is_built_in: integration.is_built_in !== false,
+            overwrites_built_in: integration.overwrites_built_in,
           });
         } else if (filter && "integration_type" in integration) {
           // Integration without a config flow
@@ -233,13 +244,14 @@ class AddIntegrationDialog extends LitElement {
             name: integration.name || domainToName(localize, domain),
             config_flow: integration.config_flow,
             is_built_in: integration.is_built_in !== false,
+            overwrites_built_in: integration.overwrites_built_in,
             cloud: integration.iot_class?.startsWith("cloud_"),
           });
         }
       });
 
       if (filter) {
-        const options: Fuse.IFuseOptions<IntegrationListItem> = {
+        const options: IFuseOptions<IntegrationListItem> = {
           keys: [
             { name: "name", weight: 5 },
             { name: "domain", weight: 5 },
@@ -248,8 +260,9 @@ class AddIntegrationDialog extends LitElement {
             "iot_standards",
           ],
           isCaseSensitive: false,
-          minMatchCharLength: 2,
+          minMatchCharLength: Math.min(filter.length, 2),
           threshold: 0.2,
+          ignoreDiacritics: true,
         };
         const helpers = Object.entries(h).map(([domain, integration]) => ({
           domain,
@@ -311,7 +324,6 @@ class AddIntegrationDialog extends LitElement {
       open
       @closed=${this.closeDialog}
       scrimClickAction
-      escapeKeyAction
       hideActions
       .heading=${createCloseHeading(
         this.hass,
@@ -338,7 +350,9 @@ class AddIntegrationDialog extends LitElement {
       !("integrations" in integration) &&
       !this._flowsInProgress?.length
     ) {
-      return "What type of device is it?";
+      return this.hass.localize(
+        "ui.panel.config.integrations.what_device_type"
+      );
     }
     if (
       integration &&
@@ -346,9 +360,11 @@ class AddIntegrationDialog extends LitElement {
       !("integrations" in integration) &&
       this._flowsInProgress?.length
     ) {
-      return "Want to add these discovered devices?";
+      return this.hass.localize(
+        "ui.panel.config.integrations.confirm_add_discovered"
+      );
     }
-    return "What do you want to add?";
+    return this.hass.localize("ui.panel.config.integrations.what_to_add");
   }
 
   private _renderIntegration(
@@ -423,8 +439,7 @@ class AddIntegrationDialog extends LitElement {
   private _renderAll(integrations?: IntegrationListItem[]): TemplateResult {
     return html`<search-input
         .hass=${this.hass}
-        autofocus
-        dialogInitialFocus
+        dialogInitialFocus=${ifDefined(this._narrow ? undefined : "")}
         .filter=${this._filter}
         @value-changed=${this._filterChanged}
         .label=${this.hass.localize(
@@ -433,22 +448,32 @@ class AddIntegrationDialog extends LitElement {
         @keypress=${this._maybeSubmit}
       ></search-input>
       ${integrations
-        ? html`<mwc-list>
+        ? html`<mwc-list
+            dialogInitialFocus=${ifDefined(this._narrow ? "" : undefined)}
+          >
             <lit-virtualizer
               scroller
+              tabindex="-1"
               class="ha-scrollbar"
               style=${styleMap({
                 width: `${this._width}px`,
                 height: this._narrow ? "calc(100vh - 184px)" : "500px",
               })}
               @click=${this._integrationPicked}
+              @keypress=${this._handleKeyPress}
               .items=${integrations}
+              .keyFunction=${this._keyFunction}
               .renderItem=${this._renderRow}
             >
             </lit-virtualizer>
           </mwc-list>`
-        : html`<ha-circular-progress active></ha-circular-progress>`} `;
+        : html`<div class="flex center">
+            <ha-circular-progress indeterminate></ha-circular-progress>
+          </div>`} `;
   }
+
+  private _keyFunction = (integration: IntegrationListItem) =>
+    integration.domain;
 
   private _renderRow = (integration: IntegrationListItem) => {
     if (!integration) {
@@ -459,6 +484,7 @@ class AddIntegrationDialog extends LitElement {
         brand
         .hass=${this.hass}
         .integration=${integration}
+        tabindex="0"
       >
       </ha-integration-list-item>
     `;
@@ -515,6 +541,12 @@ class AddIntegrationDialog extends LitElement {
     this._handleIntegrationPicked(listItem.integration);
   }
 
+  private _handleKeyPress(ev) {
+    if (ev.key === "Enter") {
+      this._integrationPicked(ev);
+    }
+  }
+
   private async _handleIntegrationPicked(integration: IntegrationListItem) {
     if (integration.supported_by) {
       this._supportedBy(integration);
@@ -536,7 +568,7 @@ class AddIntegrationDialog extends LitElement {
     if (integration.integrations) {
       let domains = integration.domains || [];
       if (integration.domain === "apple") {
-        // we show discoverd homekit devices in their own brand section, dont show them at apple
+        // we show discovered homekit devices in their own brand section, dont show them in apple
         domains = domains.filter((domain) => domain !== "homekit_controller");
       }
       this._fetchFlowsInProgress(domains);
@@ -545,7 +577,7 @@ class AddIntegrationDialog extends LitElement {
     }
 
     if (
-      (PROTOCOL_INTEGRATIONS as ReadonlyArray<string>).includes(
+      (PROTOCOL_INTEGRATIONS as readonly string[]).includes(
         integration.domain
       ) &&
       isComponentLoaded(this.hass, integration.domain)
@@ -559,17 +591,51 @@ class AddIntegrationDialog extends LitElement {
       return;
     }
 
+    if (integration.single_config_entry) {
+      const configEntries = await getConfigEntries(this.hass, {
+        domain: integration.domain,
+      });
+      if (configEntries.length > 0) {
+        this.closeDialog();
+        const localize = await this.hass.loadBackendTranslation(
+          "title",
+          integration.name
+        );
+        showAlertDialog(this, {
+          title: this.hass.localize(
+            "ui.panel.config.integrations.config_flow.single_config_entry_title"
+          ),
+          text: this.hass.localize(
+            "ui.panel.config.integrations.config_flow.single_config_entry",
+            {
+              integration_name: domainToName(localize, integration.name),
+            }
+          ),
+        });
+        return;
+      }
+    }
+
     if (integration.config_flow) {
       this._createFlow(integration.domain);
       return;
     }
 
     if (
-      ["cloud", "google_assistant", "alexa"].includes(integration.domain) &&
+      integration.domain === "cloud" &&
       isComponentLoaded(this.hass, "cloud")
     ) {
       this.closeDialog();
       navigate("/config/cloud");
+      return;
+    }
+
+    if (
+      ["google_assistant", "alexa"].includes(integration.domain) &&
+      isComponentLoaded(this.hass, "cloud")
+    ) {
+      this.closeDialog();
+      navigate("/config/voice-assistants/assistants");
       return;
     }
 
@@ -596,6 +662,7 @@ class AddIntegrationDialog extends LitElement {
       startFlowHandler: domain,
       showAdvanced: this.hass.userData?.showAdvanced,
       manifest,
+      navigateToResult: true,
     });
   }
 
@@ -668,11 +735,16 @@ class AddIntegrationDialog extends LitElement {
       p > a {
         color: var(--primary-color);
       }
-      ha-circular-progress {
-        width: 100%;
+      .flex.center {
         display: flex;
         justify-content: center;
+        align-items: center;
+      }
+      ha-circular-progress {
         margin: 24px 0;
+      }
+      mwc-list {
+        position: relative;
       }
       lit-virtualizer {
         contain: size layout !important;
@@ -693,6 +765,8 @@ class AddIntegrationDialog extends LitElement {
         margin: 0;
         margin-bottom: 8px;
         margin-left: 48px;
+        margin-inline-start: 48px;
+        margin-inline-end: initial;
         padding: 24px 24px 0 24px;
         color: var(--mdc-dialog-heading-ink-color, rgba(0, 0, 0, 0.87));
         font-size: var(--mdc-typography-headline6-font-size, 1.25rem);
