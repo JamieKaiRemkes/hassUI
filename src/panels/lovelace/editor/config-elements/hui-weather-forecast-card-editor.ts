@@ -1,18 +1,28 @@
 import { html, LitElement, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators";
 import memoizeOne from "memoize-one";
-import { assert, assign, boolean, object, optional, string } from "superstruct";
+import {
+  assert,
+  assign,
+  boolean,
+  object,
+  optional,
+  string,
+  number,
+} from "superstruct";
 import { fireEvent } from "../../../../common/dom/fire_event";
 import type { LocalizeFunc } from "../../../../common/translations/localize";
 import "../../../../components/ha-form/ha-form";
 import type { SchemaUnion } from "../../../../components/ha-form/types";
 import { UNAVAILABLE } from "../../../../data/entity";
-import type { WeatherEntity } from "../../../../data/weather";
+import type { ForecastType, WeatherEntity } from "../../../../data/weather";
+import { WeatherEntityFeature } from "../../../../data/weather";
 import type { HomeAssistant } from "../../../../types";
 import type { WeatherForecastCardConfig } from "../../cards/types";
 import type { LovelaceCardEditor } from "../../types";
 import { actionConfigStruct } from "../structs/action-struct";
 import { baseLovelaceCardConfig } from "../structs/base-card-struct";
+import { supportsFeature } from "../../../../common/entity/supports-feature";
 
 const cardConfigStruct = assign(
   baseLovelaceCardConfig,
@@ -22,6 +32,8 @@ const cardConfigStruct = assign(
     theme: optional(string()),
     show_current: optional(boolean()),
     show_forecast: optional(boolean()),
+    forecast_type: optional(string()),
+    forecast_slots: optional(number()),
     secondary_info_attribute: optional(string()),
     tap_action: optional(actionConfigStruct),
     hold_action: optional(actionConfigStruct),
@@ -44,7 +56,7 @@ export class HuiWeatherForecastCardEditor
 
     if (
       /* cannot show forecast in case it is unavailable on the entity */
-      (config.show_forecast === true && this._has_forecast === false) ||
+      (config.show_forecast === true && this._hasForecast === false) ||
       /* cannot hide both weather and forecast, need one of them */
       (config.show_current === false && config.show_forecast === false)
     ) {
@@ -53,20 +65,81 @@ export class HuiWeatherForecastCardEditor
         config: { ...config, show_current: true, show_forecast: false },
       });
     }
+    if (
+      !config.forecast_type ||
+      (config.forecast_type === "legacy" && this._modernForecastSupported()) ||
+      !this._forecastSupported(config.forecast_type)
+    ) {
+      let forecastType: string | undefined;
+      if (this._forecastSupported("daily")) {
+        forecastType = "daily";
+      } else if (this._forecastSupported("hourly")) {
+        forecastType = "hourly";
+      } else if (this._forecastSupported("twice_daily")) {
+        forecastType = "twice_daily";
+      } else if (this._forecastSupported("legacy")) {
+        forecastType = "legacy";
+      }
+      fireEvent(this, "config-changed", {
+        config: { ...config, forecast_type: forecastType },
+      });
+    }
   }
 
-  get _has_forecast(): boolean | undefined {
+  private get _stateObj(): WeatherEntity | undefined {
     if (this.hass && this._config) {
-      const stateObj = this.hass.states[this._config.entity] as WeatherEntity;
-      if (stateObj && stateObj.state !== UNAVAILABLE) {
-        return !!stateObj.attributes.forecast?.length;
-      }
+      return this.hass.states[this._config.entity] as WeatherEntity;
     }
     return undefined;
   }
 
+  private get _hasForecast(): boolean | undefined {
+    const stateObj = this._stateObj as WeatherEntity;
+    if (stateObj && stateObj.state !== UNAVAILABLE) {
+      return !!(
+        stateObj.attributes.forecast?.length ||
+        stateObj.attributes.supported_features
+      );
+    }
+    return undefined;
+  }
+
+  private _forecastSupported(forecastType: ForecastType): boolean {
+    const stateObj = this._stateObj as WeatherEntity;
+    if (forecastType === "legacy") {
+      return !!stateObj.attributes.forecast?.length;
+    }
+    if (forecastType === "daily") {
+      return supportsFeature(stateObj, WeatherEntityFeature.FORECAST_DAILY);
+    }
+    if (forecastType === "hourly") {
+      return supportsFeature(stateObj, WeatherEntityFeature.FORECAST_HOURLY);
+    }
+    if (forecastType === "twice_daily") {
+      return supportsFeature(
+        stateObj,
+        WeatherEntityFeature.FORECAST_TWICE_DAILY
+      );
+    }
+    return false;
+  }
+
+  private _modernForecastSupported(): boolean {
+    return (
+      this._forecastSupported("daily") ||
+      this._forecastSupported("hourly") ||
+      this._forecastSupported("twice_daily")
+    );
+  }
+
   private _schema = memoizeOne(
-    (localize: LocalizeFunc, hasForecast?: boolean) =>
+    (
+      localize: LocalizeFunc,
+      hasForecastLegacy?: boolean,
+      hasForecastDaily?: boolean,
+      hasForecastHourly?: boolean,
+      hasForecastTwiceDaily?: boolean
+    ) =>
       [
         {
           name: "entity",
@@ -86,7 +159,53 @@ export class HuiWeatherForecastCardEditor
             { name: "theme", selector: { theme: {} } },
           ],
         },
-        ...(hasForecast
+        ...(hasForecastDaily || hasForecastHourly || hasForecastTwiceDaily
+          ? ([
+              {
+                name: "forecast_type",
+                selector: {
+                  select: {
+                    options: [
+                      ...(hasForecastDaily
+                        ? ([
+                            {
+                              value: "daily",
+                              label: localize(
+                                "ui.panel.lovelace.editor.card.weather-forecast.daily"
+                              ),
+                            },
+                          ] as const)
+                        : []),
+                      ...(hasForecastHourly
+                        ? ([
+                            {
+                              value: "hourly",
+                              label: localize(
+                                "ui.panel.lovelace.editor.card.weather-forecast.hourly"
+                              ),
+                            },
+                          ] as const)
+                        : []),
+                      ...(hasForecastTwiceDaily
+                        ? ([
+                            {
+                              value: "twice_daily",
+                              label: localize(
+                                "ui.panel.lovelace.editor.card.weather-forecast.twice_daily"
+                              ),
+                            },
+                          ] as const)
+                        : []),
+                    ],
+                  },
+                },
+              },
+            ] as const)
+          : []),
+        ...(hasForecastDaily ||
+        hasForecastHourly ||
+        hasForecastTwiceDaily ||
+        hasForecastLegacy
           ? ([
               {
                 name: "forecast",
@@ -115,6 +234,11 @@ export class HuiWeatherForecastCardEditor
                   },
                 },
               },
+              {
+                name: "forecast_slots",
+                selector: { number: { min: 1, max: 12 } },
+                default: 5,
+              },
             ] as const)
           : []),
       ] as const
@@ -125,11 +249,17 @@ export class HuiWeatherForecastCardEditor
       return nothing;
     }
 
-    const schema = this._schema(this.hass.localize, this._has_forecast);
+    const schema = this._schema(
+      this.hass.localize,
+      this._forecastSupported("legacy"),
+      this._forecastSupported("daily"),
+      this._forecastSupported("hourly"),
+      this._forecastSupported("twice_daily")
+    );
 
     const data: WeatherForecastCardConfig = {
       show_current: true,
-      show_forecast: this._has_forecast,
+      show_forecast: this._hasForecast,
       ...this._config,
     };
 
@@ -137,8 +267,8 @@ export class HuiWeatherForecastCardEditor
       data.show_current && data.show_forecast
         ? "show_both"
         : data.show_current
-        ? "show_current"
-        : "show_forecast";
+          ? "show_current"
+          : "show_forecast";
 
     return html`
       <ha-form
@@ -184,6 +314,14 @@ export class HuiWeatherForecastCardEditor
         )} (${this.hass!.localize(
           "ui.panel.lovelace.editor.card.config.optional"
         )})`;
+      case "forecast_type":
+        return this.hass!.localize(
+          "ui.panel.lovelace.editor.card.weather-forecast.forecast_type"
+        );
+      case "forecast_slots":
+        return this.hass!.localize(
+          "ui.panel.lovelace.editor.card.weather-forecast.forecast_slots"
+        );
       case "forecast":
         return this.hass!.localize(
           "ui.panel.lovelace.editor.card.weather-forecast.weather_to_show"

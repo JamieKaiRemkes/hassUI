@@ -1,19 +1,16 @@
-import { css, html, LitElement, PropertyValues, nothing } from "lit";
+import type { PropertyValues } from "lit";
+import { css, html, LitElement, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators";
-import { ensureArray } from "../../common/array/ensure-array";
 import { isComponentLoaded } from "../../common/config/is_component_loaded";
 import { computeStateDomain } from "../../common/entity/compute_state_domain";
 import { throttle } from "../../common/util/throttle";
 import "../../components/ha-circular-progress";
-import {
-  clearLogbookCache,
-  LogbookEntry,
-  LogbookStreamMessage,
-  subscribeLogbook,
-} from "../../data/logbook";
-import { loadTraceContexts, TraceContexts } from "../../data/trace";
+import type { LogbookEntry, LogbookStreamMessage } from "../../data/logbook";
+import { subscribeLogbook } from "../../data/logbook";
+import type { TraceContexts } from "../../data/trace";
+import { loadTraceContexts } from "../../data/trace";
 import { fetchUsers } from "../../data/user";
-import { HomeAssistant } from "../../types";
+import type { HomeAssistant } from "../../types";
 import "./ha-logbook-renderer";
 
 interface LogbookTimePeriod {
@@ -34,7 +31,8 @@ const idsChanged = (oldIds?: string[], newIds?: string[]) => {
     !oldIds ||
     !newIds ||
     oldIds.length !== newIds.length ||
-    !oldIds.every((val) => newIds.includes(val))
+    oldIds.some((val) => !newIds.includes(val)) ||
+    newIds.some((val) => !oldIds.includes(val))
   );
 };
 
@@ -42,28 +40,24 @@ const idsChanged = (oldIds?: string[], newIds?: string[]) => {
 export class HaLogbook extends LitElement {
   @property({ attribute: false }) public hass!: HomeAssistant;
 
-  @property() public time!:
+  @property({ attribute: false }) public time!:
     | { range: [Date, Date] }
     | {
         // Seconds
         recent: number;
       };
 
-  @property() public entityIds?: string[];
+  @property({ attribute: false }) public entityIds?: string[];
 
-  @property() public deviceIds?: string[];
+  @property({ attribute: false }) public deviceIds?: string[];
 
-  @property({ type: Boolean, attribute: "narrow" })
-  public narrow = false;
+  @property({ type: Boolean }) public narrow = false;
 
-  @property({ type: Boolean, attribute: "virtualize", reflect: true })
-  public virtualize = false;
+  @property({ type: Boolean, reflect: true }) public virtualize = false;
 
-  @property({ type: Boolean, attribute: "no-icon" })
-  public noIcon = false;
+  @property({ type: Boolean, attribute: "no-icon" }) public noIcon = false;
 
-  @property({ type: Boolean, attribute: "no-name" })
-  public noName = false;
+  @property({ type: Boolean, attribute: "no-name" }) public noName = false;
 
   @property({ type: Boolean, attribute: "show-indicator" })
   public showIndicator = false;
@@ -71,7 +65,8 @@ export class HaLogbook extends LitElement {
   @property({ type: Boolean, attribute: "relative-time" })
   public relativeTime = false;
 
-  @property({ type: Boolean }) public showMoreLink = true;
+  @property({ attribute: "show-more-link", type: Boolean })
+  public showMoreLink = true;
 
   @state() private _logbookEntries?: LogbookEntry[];
 
@@ -81,7 +76,7 @@ export class HaLogbook extends LitElement {
 
   @state() private _error?: string;
 
-  private _subscribed?: Promise<(() => Promise<void>) | void>;
+  private _subscribed?: (() => Promise<void>) | undefined;
 
   private _liveUpdatesEnabled = true;
 
@@ -108,10 +103,7 @@ export class HaLogbook extends LitElement {
     if (this._logbookEntries === undefined) {
       return html`
         <div class="progress-wrapper">
-          <ha-circular-progress
-            active
-            alt=${this.hass.localize("ui.common.loading")}
-          ></ha-circular-progress>
+          <ha-circular-progress indeterminate></ha-circular-progress>
         </div>
       `;
     }
@@ -144,23 +136,18 @@ export class HaLogbook extends LitElement {
       return;
     }
 
-    this._unsubscribeSetLoading();
     this._throttleGetLogbookEntries.cancel();
     this._updateTraceContexts.cancel();
     this._updateUsers.cancel();
+    await this._unsubscribeSetLoading();
 
-    if ("range" in this.time) {
-      clearLogbookCache(
-        this.time.range[0].toISOString(),
-        this.time.range[1].toISOString()
-      );
+    this._liveUpdatesEnabled = true;
+
+    if (force) {
+      this._getLogBookData();
+    } else {
+      this._throttleGetLogbookEntries();
     }
-
-    this._throttleGetLogbookEntries();
-  }
-
-  protected firstUpdated(changedProps: PropertyValues) {
-    super.firstUpdated(changedProps);
   }
 
   protected shouldUpdate(changedProps: PropertyValues): boolean {
@@ -172,7 +159,7 @@ export class HaLogbook extends LitElement {
     return !oldHass || oldHass.localize !== this.hass.localize;
   }
 
-  protected updated(changedProps: PropertyValues): void {
+  protected willUpdate(changedProps: PropertyValues): void {
     let changed = changedProps.has("time");
 
     for (const key of ["entityIds", "deviceIds"]) {
@@ -210,35 +197,34 @@ export class HaLogbook extends LitElement {
   }
 
   private get _filterAlwaysEmptyResults(): boolean {
-    const entityIds = ensureArray(this.entityIds);
-    const deviceIds = ensureArray(this.deviceIds);
+    const entityIds = this.entityIds;
+    const deviceIds = this.deviceIds;
 
     // If all specified filters are empty lists, we can return an empty list.
     return (
-      (entityIds || deviceIds) &&
+      Boolean(entityIds || deviceIds) &&
       (!entityIds || entityIds.length === 0) &&
       (!deviceIds || deviceIds.length === 0)
     );
   }
 
-  private _unsubscribe(): void {
+  private async _unsubscribe(): Promise<void> {
     if (this._subscribed) {
-      this._subscribed.then((unsub) =>
-        unsub
-          ? unsub().catch(() => {
-              // The backend will cancel the subscription if
-              // we subscribe to entities that will all be
-              // filtered away
-            })
-          : undefined
-      );
-      this._subscribed = undefined;
+      try {
+        await this._subscribed();
+        this._subscribed = undefined;
+        this._pendingStreamMessages = [];
+      } catch (err: any) {
+        // eslint-disable-next-line
+        console.error("Error unsubscribing:", err);
+      }
     }
   }
 
   public connectedCallback() {
     super.connectedCallback();
     if (this.hasUpdated) {
+      // Ensure clean state before subscribing
       this._subscribeLogbookPeriod(this._calculateLogbookPeriod());
     }
   }
@@ -253,78 +239,83 @@ export class HaLogbook extends LitElement {
    * Setting this._logbookEntries to undefined
    * will put the page in a loading state.
    */
-  private _unsubscribeSetLoading() {
+  private async _unsubscribeSetLoading() {
+    await this._unsubscribe();
     this._logbookEntries = undefined;
-    this._unsubscribe();
+    this._pendingStreamMessages = [];
   }
 
   /** Unsubscribe because there are no results.
    * Setting this._logbookEntries to an empty
    * list will show a no results message.
    */
-  private _unsubscribeNoResults() {
+  private async _unsubscribeNoResults() {
+    await this._unsubscribe();
     this._logbookEntries = [];
-    this._unsubscribe();
+    this._pendingStreamMessages = [];
   }
 
   private _calculateLogbookPeriod() {
     const now = new Date();
     if ("range" in this.time) {
-      return <LogbookTimePeriod>{
+      return {
         now: now,
         startTime: this.time.range[0],
         endTime: this.time.range[1],
         purgeBeforePythonTime: undefined,
-      };
+      } as LogbookTimePeriod;
     }
     if ("recent" in this.time) {
       const purgeBeforePythonTime = findStartOfRecentTime(
         now,
         this.time.recent
       );
-      return <LogbookTimePeriod>{
+      return {
         now: now,
         startTime: new Date(purgeBeforePythonTime * 1000),
         // end streaming one year from now
         endTime: new Date(now.getTime() + 86400 * 365 * 1000),
         purgeBeforePythonTime: findStartOfRecentTime(now, this.time.recent),
-      };
+      } as LogbookTimePeriod;
     }
     throw new Error("Unexpected time specified");
   }
 
-  private _subscribeLogbookPeriod(logbookPeriod: LogbookTimePeriod) {
+  private async _subscribeLogbookPeriod(
+    logbookPeriod: LogbookTimePeriod
+  ): Promise<void> {
     if (this._subscribed) {
-      return true;
+      return;
     }
-    this._subscribed = subscribeLogbook(
-      this.hass,
-      (streamMessage) => {
-        // "recent" means start time is a sliding window
-        // so we need to calculate an expireTime to
-        // purge old events
-        if (!this._subscribed) {
-          // Message came in before we had a chance to unload
-          return;
-        }
-        this._processOrQueueStreamMessage(streamMessage);
-      },
-      logbookPeriod.startTime.toISOString(),
-      logbookPeriod.endTime.toISOString(),
-      ensureArray(this.entityIds),
-      ensureArray(this.deviceIds)
-    ).catch((err) => {
+    try {
+      this._subscribed = await subscribeLogbook(
+        this.hass,
+        (streamMessage) => {
+          // "recent" means start time is a sliding window
+          // so we need to calculate an expireTime to
+          // purge old events
+          if (!this._subscribed) {
+            // Message came in before we had a chance to unload
+            return;
+          }
+          this._processOrQueueStreamMessage(streamMessage);
+        },
+        logbookPeriod.startTime.toISOString(),
+        logbookPeriod.endTime.toISOString(),
+        this.entityIds,
+        this.deviceIds
+      );
+    } catch (err: any) {
       this._subscribed = undefined;
       this._error = err;
-    });
-    return true;
+    }
   }
 
   private async _getLogBookData() {
     this._error = undefined;
 
     if (this._filterAlwaysEmptyResults) {
-      this._unsubscribeNoResults();
+      await this._unsubscribeNoResults();
       return;
     }
 
@@ -332,7 +323,7 @@ export class HaLogbook extends LitElement {
 
     if (logbookPeriod.startTime > logbookPeriod.now) {
       // Time Travel not yet invented
-      this._unsubscribeNoResults();
+      await this._unsubscribeNoResults();
       return;
     }
 
@@ -348,10 +339,10 @@ export class HaLogbook extends LitElement {
     !this._logbookEntries
       ? []
       : purgeBeforePythonTime
-      ? this._logbookEntries.filter(
-          (entry) => entry.when > purgeBeforePythonTime!
-        )
-      : this._logbookEntries;
+        ? this._logbookEntries.filter(
+            (entry) => entry.when > purgeBeforePythonTime!
+          )
+        : this._logbookEntries;
 
   private _processOrQueueStreamMessage = (
     streamMessage: LogbookStreamMessage
